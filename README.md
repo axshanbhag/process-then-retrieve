@@ -6,7 +6,7 @@ This repository is an organized copy of the collaborative [Process-then-Retrieve
 
 - [Python scripts](python/) includes model loading, probing, activation patching, and residual-stream analysis.
 - [Notebook exports](notebook-exports/) preserves experiment files that contain notebook commands. They retain their original extensions and some cells require a notebook runtime.
-- [Figures](figures/) is reserved for verified experiment outputs.
+- [Figures](figures/) contains figures and original captions from the arXiv preprint and ICLR workshop PDF.
 
 ## Papers
 - [ICLR Sci4DL workshop paper](https://openreview.net/forum?id=OneeMnj1hh)
