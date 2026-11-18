@@ -1,0 +1,686 @@
+# REQUIRED PACKAGES
+!pip install -q transformers datasets pillow torch matplotlib numpy tqdm requests circuitsvis accelerate huggingface_hub
+
+import torch
+import torch.nn.functional as F
+from transformers import AutoProcessor, AutoModelForVision2Seq
+from datasets import load_dataset
+from PIL import Image
+import numpy as np
+import matplotlib.pyplot as plt
+from io import BytesIO
+import requests
+import circuitsvis as cv
+from IPython.display import display, HTML
+import random
+import os
+import gc
+import seaborn as sns
+from typing import Dict, List, Tuple
+
+
+# LOGIN (REPLACE WITH TOKEN)
+from huggingface_hub import login
+#login(token = "TOKEN")
+
+
+# functions
+class AttentionSubContributionAnalyzer:
+    """
+    Analyzer for PaliGemma attention score sub-contributions.
+    Extracts and visualizes Image→Image, Text→Image, Image→Text, and Text→Text regions.
+    """
+
+    def __init__(self, image_tokens: int = 1024):
+        self.image_tokens = image_tokens
+
+    def extract_regions(self, attention_matrix: np.ndarray, num_text_tokens: int) -> Dict[str, np.ndarray]:
+        """
+        Extract the four attention regions from a full attention matrix.
+
+        Args:
+            attention_matrix: Full attention matrix of shape [total_tokens, total_tokens]
+            num_text_tokens: Number of text tokens in the sequence
+
+        Returns:
+            Dictionary with keys: 'image_image', 'image_text', 'text_image', 'text_text'
+        """
+        img = self.image_tokens
+
+        regions = {
+            'image_image': attention_matrix[:img, :img],
+            'image_text': attention_matrix[:img, img:img+num_text_tokens],
+            'text_image': attention_matrix[img:img+num_text_tokens, :img],
+            'text_text': attention_matrix[img:img+num_text_tokens, img:img+num_text_tokens]
+        }
+
+        return regions
+
+    def compute_region_stats(self, regions: Dict[str, np.ndarray]) -> Dict[str, Dict[str, float]]:
+        """Compute statistics for each region."""
+        stats = {}
+
+        for name, matrix in regions.items():
+            stats[name] = {
+                'mean': float(np.mean(matrix)),
+                'std': float(np.std(matrix)),
+                'min': float(np.min(matrix)),
+                'max': float(np.max(matrix)),
+                'median': float(np.median(matrix))
+            }
+
+        return stats
+
+    def visualize_attention_matrix_heatmap(self, attention_matrix: np.ndarray,
+                                          num_text_tokens: int,
+                                          layer_idx: int = 0,
+                                          downsample: int = 4,
+                                          figsize: Tuple[int, int] = (16, 14)): 
+        """
+        Visualize the full attention matrix as a heatmap with clear region boundaries.
+        This creates a visualization similar to adjacency matrices in graph theory.
+
+        Args:
+            attention_matrix: Attention matrix to visualize
+            num_text_tokens: Number of text tokens
+            layer_idx: Layer index for title
+            downsample: Factor to downsample large matrices for visualization
+            figsize: Figure size
+        """
+        img = self.image_tokens
+
+        # Downsample if needed
+        if downsample > 1:
+            matrix_display = attention_matrix[::downsample, ::downsample]
+            img_boundary = img // downsample
+        else:
+            matrix_display = attention_matrix
+            img_boundary = img
+
+        fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+        # Plot 1: Standard heatmap with viridis colormap
+        im1 = axes[0].imshow(matrix_display, cmap='viridis', aspect='equal', interpolation='nearest')
+        axes[0].set_title(f'Layer {layer_idx} - Attention Matrix Heatmap\n(Viridis Colormap)',
+                         fontsize=14, fontweight='bold', pad=20)
+        axes[0].set_xlabel('Key Tokens (To)', fontsize=12)
+        axes[0].set_ylabel('Query Tokens (From)', fontsize=12)
+
+        # Add grid lines to separate regions
+        axes[0].axhline(y=img_boundary-0.5, color='red', linewidth=3, linestyle='-')
+        axes[0].axvline(x=img_boundary-0.5, color='red', linewidth=3, linestyle='-')
+
+        # Add region labels with better positioning
+        axes[0].text(img_boundary//2, -matrix_display.shape[0]*0.05, 'Image Tokens',
+                    ha='center', va='top', fontsize=11, fontweight='bold', color='blue')
+        axes[0].text(img_boundary + (matrix_display.shape[1]-img_boundary)//2, -matrix_display.shape[0]*0.05,
+                    'Text Tokens', ha='center', va='top', fontsize=11, fontweight='bold', color='red')
+
+        axes[0].text(-matrix_display.shape[1]*0.08, img_boundary//2, 'Image\nTokens',
+                    ha='right', va='center', fontsize=11, fontweight='bold', color='blue', rotation=90)
+        axes[0].text(-matrix_display.shape[1]*0.08, img_boundary + (matrix_display.shape[0]-img_boundary)//2,
+                    'Text\nTokens', ha='right', va='center', fontsize=11, fontweight='bold', color='red', rotation=90)
+
+        # Add quadrant labels
+        axes[0].text(img_boundary//2, img_boundary//2, 'Image→Image',
+                    ha='center', va='center', fontsize=10, fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.8, edgecolor='blue', linewidth=2))
+        axes[0].text(img_boundary + (matrix_display.shape[1]-img_boundary)//2, img_boundary//2,
+                    'Image→Text', ha='center', va='center', fontsize=10, fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.8, edgecolor='orange', linewidth=2))
+        axes[0].text(img_boundary//2, img_boundary + (matrix_display.shape[0]-img_boundary)//2,
+                    'Text→Image', ha='center', va='center', fontsize=10, fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.8, edgecolor='green', linewidth=2))
+        axes[0].text(img_boundary + (matrix_display.shape[1]-img_boundary)//2,
+                    img_boundary + (matrix_display.shape[0]-img_boundary)//2,
+                    'Text→Text', ha='center', va='center', fontsize=10, fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.5', facecolor='white', alpha=0.8, edgecolor='red', linewidth=2))
+
+        cbar1 = plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+        cbar1.set_label('Attention Score', fontsize=11)
+
+        # Plot 2: Region-colored visualization
+        matrix_colored = np.zeros((*matrix_display.shape, 3))
+
+        # Normalize for better visibility
+        norm_matrix = (matrix_display - matrix_display.min()) / (matrix_display.max() - matrix_display.min() + 1e-10)
+
+        # Color each region with distinct colors
+        # Image→Image (Blue channel)
+        matrix_colored[:img_boundary, :img_boundary, 2] = norm_matrix[:img_boundary, :img_boundary]
+
+        # Text→Image (Green channel)
+        matrix_colored[img_boundary:, :img_boundary, 1] = norm_matrix[img_boundary:, :img_boundary]
+
+        # Image→Text (Orange = Red + half Green)
+        matrix_colored[:img_boundary, img_boundary:, 0] = norm_matrix[:img_boundary, img_boundary:]
+        matrix_colored[:img_boundary, img_boundary:, 1] = norm_matrix[:img_boundary, img_boundary:] * 0.6
+
+        # Text→Text (Red channel)
+        matrix_colored[img_boundary:, img_boundary:, 0] = norm_matrix[img_boundary:, img_boundary:]
+
+        axes[1].imshow(matrix_colored, aspect='equal', interpolation='nearest')
+        axes[1].set_title(f'Layer {layer_idx} - Region-Colored Matrix',
+                         fontsize=14, fontweight='bold', pad=20)
+        axes[1].set_xlabel('Key Tokens (To)', fontsize=12)
+        axes[1].set_ylabel('Query Tokens (From)', fontsize=12)
+
+        # Add grid lines
+        axes[1].axhline(y=img_boundary-0.5, color='white', linewidth=3, linestyle='-')
+        axes[1].axvline(x=img_boundary-0.5, color='white', linewidth=3, linestyle='-')
+
+        # Add legend for colors
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='blue', label='Image→Image', edgecolor='black'),
+            Patch(facecolor='green', label='Text→Image', edgecolor='black'),
+            Patch(facecolor='orange', label='Image→Text', edgecolor='black'),
+            Patch(facecolor='red', label='Text→Text', edgecolor='black')
+        ]
+        axes[1].legend(handles=legend_elements, loc='upper right', fontsize=10)
+
+        plt.tight_layout()
+        plt.show()
+
+        # Print statistics
+        regions = self.extract_regions(attention_matrix, num_text_tokens)
+        stats = self.compute_region_stats(regions)
+
+        print(f"\n{'='*60}")
+        print(f"Layer {layer_idx} - Attention Statistics")
+        print(f"{'='*60}")
+        print(f"Matrix shape: {attention_matrix.shape}")
+        print(f"Image tokens: 0-{img}, Text tokens: {img}-{img+num_text_tokens}")
+        print(f"\nRegion Means (showing sub-contributions):")
+        print(f"  Image→Image: {stats['image_image']['mean']:.6f}")
+        print(f"  Text→Image:  {stats['text_image']['mean']:.6f}")
+        print(f"  Image→Text:  {stats['image_text']['mean']:.6f}")
+        print(f"  Text→Text:   {stats['text_text']['mean']:.6f}")
+        print(f"{'='*60}\n")
+
+    def visualize_individual_regions(self, attention_matrix: np.ndarray,
+                                    num_text_tokens: int,
+                                    layer_idx: int = 0,
+                                    downsample_img: int = 8,
+                                    figsize: Tuple[int, int] = (16, 12)): 
+        """
+        Visualize each of the four regions as separate heatmaps.
+
+        Args:
+            attention_matrix: Full attention matrix
+            num_text_tokens: Number of text tokens
+            layer_idx: Layer index
+            downsample_img: Downsample factor for image regions (text regions shown in full)
+            figsize: Figure size
+        """
+        regions = self.extract_regions(attention_matrix, num_text_tokens)
+        stats = self.compute_region_stats(regions)
+
+        fig, axes = plt.subplots(2, 2, figsize=figsize)
+        fig.suptitle(f'Layer {layer_idx} - Individual Region Heatmaps', fontsize=16, fontweight='bold')
+
+        region_list = [
+            ('image_image', 'Image → Image', 'Blues', (0, 0)),
+            ('text_image', 'Text → Image', 'Greens', (1, 0)),
+            ('image_text', 'Image → Text', 'Oranges', (0, 1)),
+            ('text_text', 'Text → Text', 'Reds', (1, 1))
+        ]
+
+        for region_name, title, cmap, (row, col) in region_list:
+            region_data = regions[region_name]
+            region_stat = stats[region_name]
+
+            # Downsample image regions for visualization
+            if 'image' in region_name.split('_')[0]:  # If query is image
+                display_data = region_data[::downsample_img, :]
+            else:
+                display_data = region_data
+
+            if 'image' in region_name.split('_')[1]:  # If key is image
+                display_data = display_data[:, ::downsample_img]
+
+            ax = axes[row, col]
+            im = ax.imshow(display_data, cmap=cmap, aspect='auto', interpolation='nearest')
+            ax.set_title(f'{title}\nMean: {region_stat["mean"]:.6f}', fontweight='bold', fontsize=12)
+
+            # Set axis labels based on region
+            query_type = region_name.split('_')[0]
+            key_type = region_name.split('_')[1]
+            ax.set_ylabel(f'{query_type.capitalize()} Tokens (Query)', fontsize=10)
+            ax.set_xlabel(f'{key_type.capitalize()} Tokens (Key)', fontsize=10)
+
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+            # Add grid for better readability
+            ax.grid(False)
+
+        plt.tight_layout()
+        plt.show()
+
+
+def extract_paligemma_attention(model, processor, image, text_prompt):
+    """Extract attention matrices from PaliGemma model."""
+    inputs = processor(images=image, text=text_prompt, return_tensors="pt")
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = model(**inputs, output_attentions=True, output_hidden_states=True)
+
+    attention_matrices = []
+    for layer_attn in outputs.attentions:
+        avg_attn = layer_attn[0].mean(dim=0).cpu().numpy()
+        attention_matrices.append(avg_attn)
+
+    return attention_matrices
+
+#   load Paligemma
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model_id = "google/paligemma-3b-pt-448"
+
+processor = AutoProcessor.from_pretrained(model_id)
+model = AutoModelForVision2Seq.from_pretrained(
+    model_id,
+    output_attentions=True,
+    output_hidden_states=True,
+    torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+    device_map="auto",
+    attn_implementation="eager"
+)
+model.eval()
+
+# Load 5 samples
+# Shuffle the dataset with a random seed for randomness each run
+import time
+random_seed = int(time.time())  # Use current time as seed for different results each run
+
+dataset = load_dataset("tomg-group-umd/pixelprose", split="train", streaming=True)
+dataset = dataset.shuffle(seed=random_seed, buffer_size=1000)
+
+def read_image_from_url(url):
+    try:
+        response = requests.get(url, timeout=10)
+        return Image.open(BytesIO(response.content)).convert("RGB")
+    except:
+        return None
+
+dataset_iter = iter(dataset)
+
+images = []
+captions = []
+attempt_count = 0
+
+while len(images) < 5 and attempt_count < 150:
+    try:
+        row = next(dataset_iter)
+        attempt_count += 1
+        img = read_image_from_url(row["url"])
+        if img is not None:
+            images.append(img)
+            captions.append(row["vlm_caption"])
+    except StopIteration:
+        break
+
+if len(images) < 5:
+    raise RuntimeError(f"Could only load {len(images)} valid images")
+
+
+# Hooks
+
+attention_outputs = {}
+mlp_outputs = {}
+residual_before_attn = {}
+residual_after_attn = {}
+
+def create_attn_hook(layer_idx):
+    def hook(module, input, output):
+        attention_outputs[layer_idx] = output[0].detach().cpu().to(torch.float32)
+        if len(input) > 0 and input[0] is not None:
+            residual_before_attn[layer_idx] = input[0].detach().cpu().to(torch.float32)
+        else:
+            residual_before_attn[layer_idx] = torch.zeros_like(output[0]).cpu().to(torch.float32)
+        torch.cuda.empty_cache()
+    return hook
+
+def create_mlp_hook(layer_idx):
+    def hook(module, input, output):
+        mlp_outputs[layer_idx] = output.detach().cpu().to(torch.float32)
+        if len(input) > 0 and input[0] is not None:
+            residual_after_attn[layer_idx] = input[0].detach().cpu().to(torch.float32)
+        else:
+            residual_after_attn[layer_idx] = torch.zeros_like(output).cpu().to(torch.float32)
+        torch.cuda.empty_cache()
+    return hook
+
+handles = []
+language_model = model.language_model
+num_layers = len(language_model.layers)
+
+for layer_idx, layer in enumerate(language_model.layers):
+    handles.append(layer.self_attn.register_forward_hook(create_attn_hook(layer_idx)))
+    handles.append(layer.mlp.register_forward_hook(create_mlp_hook(layer_idx)))
+
+all_attn_text_contrib = []
+all_mlp_text_contrib = []
+all_attn_vision_contrib = []
+all_mlp_vision_contrib = []
+
+all_attn_text_abs = []
+all_mlp_text_abs = []
+all_attn_vision_abs = []
+all_mlp_vision_abs = []
+
+for sample_idx, (image, caption) in enumerate(zip(images, captions)):
+
+    # Clear dictionaries for each sample (hooks will repopulate for this sample)
+    attention_outputs.clear()
+    mlp_outputs.clear()
+    residual_before_attn.clear()
+    residual_after_attn.clear()
+
+    inputs = processor(images=image, text="<image> " + caption[:100], return_tensors="pt").to(device)
+
+    input_ids = inputs['input_ids'][0].cpu().tolist()
+    image_token_id = processor.tokenizer.convert_tokens_to_ids('<image>')
+    vision_tokens = input_ids.count(image_token_id)
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    hidden_states = outputs.hidden_states
+
+    # Clear GPU memory immediately
+    del outputs
+    del inputs
+    torch.cuda.empty_cache()
+
+    print(f"  Vision tokens: {vision_tokens}")
+
+    # Lists for current sample's contributions
+    attn_text_contrib_current = []
+    mlp_text_contrib_current = []
+    attn_vision_contrib_current = []
+    mlp_vision_contrib_current = []
+    attn_text_abs_current = []
+    mlp_text_abs_current = []
+    attn_vision_abs_current = []
+    mlp_vision_abs_current = []
+
+    for layer_idx in range(num_layers):
+        if (layer_idx not in attention_outputs or
+            layer_idx not in mlp_outputs or
+            layer_idx not in residual_before_attn or
+            layer_idx not in residual_after_attn):
+            # Append placeholders to maintain length consistency if a layer is skipped
+            attn_text_contrib_current.append(0.0) 
+            mlp_text_contrib_current.append(0.0)  
+            attn_vision_contrib_current.append(0.0) 
+            mlp_vision_contrib_current.append(0.0)  
+            attn_text_abs_current.append(0.0)     
+            mlp_text_abs_current.append(0.0)      
+            attn_vision_abs_current.append(0.0)   
+            mlp_vision_abs_current.append(0.0)    
+            continue
+
+        # Check if there are actual text tokens to analyze in this slice
+        if vision_tokens < attention_outputs[layer_idx].shape[1]:
+            attn_out_text = attention_outputs[layer_idx][0, vision_tokens:]
+            mlp_out_text = mlp_outputs[layer_idx][0, vision_tokens:]
+            res_before_attn_text = residual_before_attn[layer_idx][0, vision_tokens:]
+            res_after_attn_text = residual_after_attn[layer_idx][0, vision_tokens:]
+
+            if attn_out_text.shape[0] > 0: # Ensure there are tokens in the slice
+                attn_delta_text = res_after_attn_text - res_before_attn_text
+                attn_norm_text = torch.norm(attn_delta_text, dim=-1).mean().item()
+                mlp_norm_text = torch.norm(mlp_out_text, dim=-1).mean().item() # MLP output itself is the contribution
+
+                total_norm_text = attn_norm_text + mlp_norm_text
+
+                if total_norm_text > 1e-8:
+                    attn_rel_text = attn_norm_text / total_norm_text
+                    mlp_rel_text = mlp_norm_text / total_norm_text
+                else:
+                    attn_rel_text = 0.5
+                    mlp_rel_text = 0.5
+            else:
+                attn_rel_text = 0.0
+                mlp_rel_text = 0.0
+                attn_norm_text = 0.0
+                mlp_norm_text = 0.0
+        else: # No text tokens present in the sequence after vision tokens
+            attn_rel_text = 0.0
+            mlp_rel_text = 0.0
+            attn_norm_text = 0.0
+            mlp_norm_text = 0.0
+
+        attn_text_contrib_current.append(attn_rel_text)
+        mlp_text_contrib_current.append(mlp_rel_text)
+        attn_text_abs_current.append(attn_norm_text)
+        mlp_text_abs_current.append(mlp_norm_text)
+
+        # --- Analyze VISION TOKENS ---
+        # Check if there are actual vision tokens to analyze
+        if vision_tokens > 0:
+            attn_out_vision = attention_outputs[layer_idx][0, :vision_tokens]
+            mlp_out_vision = mlp_outputs[layer_idx][0, :vision_tokens]
+            res_before_attn_vision = residual_before_attn[layer_idx][0, :vision_tokens]
+            res_after_attn_vision = residual_after_attn[layer_idx][0, :vision_tokens]
+
+            if attn_out_vision.shape[0] > 0: # Ensure there are tokens in the slice
+                attn_delta_vision = res_after_attn_vision - res_before_attn_vision
+                attn_norm_vision = torch.norm(attn_delta_vision, dim=-1).mean().item()
+                mlp_norm_vision = torch.norm(mlp_out_vision, dim=-1).mean().item()
+
+                total_norm_vision = attn_norm_vision + mlp_norm_vision
+
+                if total_norm_vision > 1e-8:
+                    attn_rel_vision = attn_norm_vision / total_norm_vision
+                    mlp_rel_vision = mlp_norm_vision / total_norm_vision
+                else:
+                    attn_rel_vision = 0.5
+                    mlp_rel_vision = 0.5
+            else:
+                attn_rel_vision = 0.0
+                mlp_rel_vision = 0.0
+                attn_norm_vision = 0.0
+                mlp_norm_vision = 0.0
+        else:
+            attn_rel_vision = 0.0
+            mlp_rel_vision = 0.0
+            attn_norm_vision = 0.0
+            mlp_norm_vision = 0.0
+
+        attn_vision_contrib_current.append(attn_rel_vision)
+        mlp_vision_contrib_current.append(mlp_rel_vision)
+        attn_vision_abs_current.append(attn_norm_vision)
+        mlp_vision_abs_current.append(mlp_norm_vision)
+
+    all_attn_text_contrib.append(attn_text_contrib_current)
+    all_mlp_text_contrib.append(mlp_text_contrib_current)
+    all_attn_vision_contrib.append(attn_vision_contrib_current)
+    all_mlp_vision_contrib.append(mlp_vision_contrib_current)
+
+    all_attn_text_abs.append(attn_text_abs_current)
+    all_mlp_text_abs.append(mlp_text_abs_current)
+    all_attn_vision_abs.append(attn_vision_abs_current)
+    all_mlp_vision_abs.append(mlp_vision_abs_current)
+
+    # Clear memory after each image
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    gc.collect()
+
+# Remove hooks outside the loop after all samples are processed
+for handle in handles:
+    handle.remove()
+
+# Average
+# Determine max_len across all contribution lists (relative and absolute)
+all_list_of_lists = [
+    all_attn_text_contrib, all_mlp_text_contrib, all_attn_vision_contrib, all_mlp_vision_contrib,
+    all_attn_text_abs, all_mlp_text_abs, all_attn_vision_abs, all_mlp_vision_abs
+]
+
+# Filter out empty lists before finding max length
+valid_lengths_all_inner_lists = [len(x) for sublist_outer in all_list_of_lists for x in sublist_outer if len(x) > 0]
+
+if not valid_lengths_all_inner_lists:
+    # Fallback if no valid layers were processed for ANY sample for ANY contribution type
+    print("Warning: No valid layer contributions were recorded for any sample. Setting max_len to num_layers.")
+    max_len = num_layers
+else:
+    max_len = max(valid_lengths_all_inner_lists)
+
+def pad_to_length(list_of_lists, target_len, default_val=0.0):
+    padded_list_of_lists = []
+    if not list_of_lists: 
+        # If list_of_lists itself is empty (e.g., if all samples failed), create a structure for expected samples
+        # Assuming 5 samples based on context, fill with default padded lists
+        return [[default_val] * target_len for _ in range(5)] 
+
+    for inner_list in list_of_lists:
+        if len(inner_list) < target_len:
+            # Pad with the last valid value, or default_val if inner_list is empty
+            padded_inner = inner_list + [inner_list[-1]] * (target_len - len(inner_list)) if len(inner_list) > 0 else [default_val] * target_len
+            padded_list_of_lists.append(padded_inner)
+        else:
+            padded_list_of_lists.append(inner_list[:target_len])
+    return padded_list_of_lists
+
+
+# Apply padding to all contribution lists
+all_attn_text_contrib = pad_to_length(all_attn_text_contrib, max_len, default_val=0.5)
+all_mlp_text_contrib = pad_to_length(all_mlp_text_contrib, max_len, default_val=0.5)
+all_attn_vision_contrib = pad_to_length(all_attn_vision_contrib, max_len, default_val=0.5)
+all_mlp_vision_contrib = pad_to_length(all_mlp_vision_contrib, max_len, default_val=0.5)
+
+all_attn_text_abs = pad_to_length(all_attn_text_abs, max_len, default_val=0.0)
+all_mlp_text_abs = pad_to_length(all_mlp_text_abs, max_len, default_val=0.0)
+all_attn_vision_abs = pad_to_length(all_attn_vision_abs, max_len, default_val=0.0)
+all_mlp_vision_abs = pad_to_length(all_mlp_vision_abs, max_len, default_val=0.0)
+
+avg_attn_text = np.mean(all_attn_text_contrib, axis=0)
+avg_mlp_text = np.mean(all_mlp_text_contrib, axis=0)
+avg_attn_vision = np.mean(all_attn_vision_contrib, axis=0)
+avg_mlp_vision = np.mean(all_mlp_vision_contrib, axis=0)
+
+# Average absolute contributions as well
+avg_attn_text_abs = np.mean(all_attn_text_abs, axis=0)
+avg_mlp_text_abs = np.mean(all_mlp_text_abs, axis=0)
+avg_attn_vision_abs = np.mean(all_attn_vision_abs, axis=0)
+avg_mlp_vision_abs = np.mean(all_mlp_vision_abs, axis=0)
+
+# Graph
+layers = np.arange(max_len) 
+
+# Convert to percentages for stacked bars
+attn_pct_text = avg_attn_text * 100
+mlp_pct_text = avg_mlp_text * 100
+attn_pct_vision = avg_attn_vision * 100
+mlp_pct_vision = avg_mlp_vision * 100
+
+# Text Tokens
+fig1, ax1 = plt.subplots(figsize=(10, 6))
+fig1.patch.set_facecolor('white')
+ax1.set_facecolor('white')
+
+ax1.bar(layers, attn_pct_text, color='#1976D2', alpha=0.7, label='Attention')
+ax1.bar(layers, mlp_pct_text, bottom=attn_pct_text, color='#D32F2F', alpha=0.7, label='MLP')
+
+ax1.set_xlabel('Layer', fontsize=12)
+ax1.set_ylabel('Contribution (%)', fontsize=12)
+ax1.set_title('Text Tokens: Relative Contribution (Attention vs MLP)\n(Averaged over 5 random samples)', fontsize=14, fontweight='bold')
+ax1.legend(loc='best', framealpha=0.9)
+ax1.grid(True, alpha=0.3, axis='y')
+ax1.spines['top'].set_visible(False)
+ax1.spines['right'].set_visible(False)
+
+plt.tight_layout()
+plt.show()
+
+fig2, ax2 = plt.subplots(figsize=(12, 7))
+fig2.patch.set_facecolor('white')
+ax2.set_facecolor('white')
+
+ax2.plot(layers, avg_attn_text_abs, color='#1976D2', linewidth=2.5, marker='o',
+         markersize=6, label='Attention', alpha=0.8)
+ax2.plot(layers, avg_mlp_text_abs, color='#D32F2F', linewidth=2.5, marker='s',
+         markersize=6, label='MLP', alpha=0.8)
+
+ax2.set_xlabel('Layer', fontsize=12)
+ax2.set_ylabel('Absolute Contribution (L2 Norm)', fontsize=12)
+ax2.set_title('Text Tokens: Absolute Contributions by Layer (PaliGemma)\n(Averaged over 5 random samples)',
+              fontsize=14, fontweight='bold')
+ax2.legend(loc='best', framealpha=0.9, fontsize=11)
+ax2.grid(True, alpha=0.3)
+ax2.spines['top'].set_visible(False)
+ax2.spines['right'].set_visible(False)
+
+plt.tight_layout()
+plt.show()
+
+# Vision tokens
+fig3, ax3 = plt.subplots(figsize=(10, 6))
+fig3.patch.set_facecolor('white')
+ax3.set_facecolor('white')
+
+ax3.bar(layers, attn_pct_vision, color='#1976D2', alpha=0.7, label='Attention')
+ax3.bar(layers, mlp_pct_vision, bottom=attn_pct_vision, color='#D32F2F', alpha=0.7, label='MLP')
+
+ax3.set_xlabel('Layer', fontsize=12)
+ax3.set_ylabel('Contribution (%)', fontsize=12)
+ax3.set_title('Vision Tokens: Relative Contribution (Attention vs MLP)\n(Averaged over 5 random samples)', fontsize=14, fontweight='bold')
+ax3.legend(loc='best', framealpha=0.9)
+ax3.grid(True, alpha=0.3, axis='y')
+ax3.spines['top'].set_visible(False)
+ax3.spines['right'].set_visible(False)
+
+plt.tight_layout()
+plt.show()
+
+fig4, ax4 = plt.subplots(figsize=(12, 7))
+fig4.patch.set_facecolor('white')
+ax4.set_facecolor('white')
+
+ax4.plot(layers, avg_attn_vision_abs, color='#1976D2', linewidth=2.5, marker='o',
+         markersize=6, label='Attention', alpha=0.8)
+ax4.plot(layers, avg_mlp_vision_abs, color='#D32F2F', linewidth=2.5, marker='s',
+         markersize=6, label='MLP', alpha=0.8)
+
+ax4.set_xlabel('Layer', fontsize=12)
+ax4.set_ylabel('Absolute Contribution (L2 Norm)', fontsize=12)
+ax4.set_title('Vision Tokens: Absolute Contribution (Attention vs MLP)\n(Averaged over 5 random samples)',
+              fontsize=14, fontweight='bold')
+ax4.legend(loc='best', framealpha=0.9, fontsize=11)
+ax4.grid(True, alpha=0.3)
+ax4.spines['top'].set_visible(False)
+ax4.spines['right'].set_visible(False)
+
+plt.tight_layout()
+plt.show()
+
+
+# Print
+print("\nRELATIVE CONTRIBUTIONS:")
+print("\nTEXT TOKENS:")
+print(f"  Average Attention Contribution: {np.mean(avg_attn_text)*100:.2f}%")
+print(f"  Average MLP Contribution: {np.mean(avg_mlp_text)*100:.2f}%")
+
+print("\nVISION TOKENS:")
+print(f"  Average Attention Contribution: {np.mean(avg_attn_vision)*100:.2f}%")
+print(f"  Average MLP Contribution: {np.mean(avg_mlp_vision)*100:.2f}%")
+
+print("\nABSOLUTE CONTRIBUTIONS:")
+print("\nTEXT TOKENS:")
+print(f"  Average Attention: {np.mean(avg_attn_text_abs):.6f}")
+print(f"  Average MLP: {np.mean(avg_mlp_text_abs):.6f}")
+
+print("\nVISION TOKENS:")
+print(f"  Average Attention: {np.mean(avg_attn_vision_abs):.6f}")
+print(f"  Average MLP: {np.mean(avg_mlp_vision_abs):.6f}")
+
+attn_dominant_layers = [i for i, (attn, mlp) in enumerate(zip(avg_attn_text_abs, avg_mlp_text_abs)) if attn > mlp]
+mlp_dominant_layers = [i for i, (attn, mlp) in enumerate(zip(avg_attn_text_abs, avg_mlp_text_abs)) if mlp > attn]
+
+print(f"  Attention dominates in {len(attn_dominant_layers)} layers: {attn_dominant_layers}")
+print(f"  MLP dominates in {len(mlp_dominant_layers)} layers: {mlp_dominant_layers}")

@@ -1,0 +1,82 @@
+!pip install -q transformers datasets pillow torch accelerate huggingface_hub
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from transformers import AutoTokenizer, AutoModel
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+
+MODEL_NAME = "google/paligemma-3b-pt-448"
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModel.from_pretrained(MODEL_NAME, output_hidden_states=True)
+model.eval()
+
+TOTAL_LAYERS = model.config.num_hidden_layers
+TRAINED_LAYER_START = TOTAL_LAYERS - 4
+SEED = 42
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+images = ["path/img1.jpg", "path/img2.jpg", "path/img3.jpg"]
+captions = ["A dog on grass", "A cat on sofa", "A car on street"]
+labels = np.array([0, 1, 2])
+
+def get_hidden_states(images, captions):
+    img_inputs = tokenizer(images, return_tensors="pt", padding=True, truncation=True)
+    txt_inputs = tokenizer(captions, return_tensors="pt", padding=True, truncation=True)
+    with torch.no_grad():
+        out = model(**img_inputs, **txt_inputs)
+    return out.hidden_states
+
+hidden_states = get_hidden_states(images, captions)
+
+vision_X = [h[:, 0, :].cpu().numpy() for h in hidden_states]
+text_X   = [h[:, 0, :].cpu().numpy() for h in hidden_states]
+
+vision_test_acc = np.zeros(TOTAL_LAYERS)
+text_test_acc   = np.zeros(TOTAL_LAYERS)
+
+train_idxs = list(range(TRAINED_LAYER_START, TOTAL_LAYERS))
+
+for layer_idx in range(TOTAL_LAYERS):
+    Xv_train = np.vstack([vision_X[i] for i in train_idxs])
+    yv_train = np.tile(labels, len(train_idxs))
+    clf_v = LogisticRegression(max_iter=2000).fit(Xv_train, yv_train)
+    vision_test_acc[layer_idx] = accuracy_score(labels, clf_v.predict(vision_X[layer_idx]))
+
+    Xt_train = np.vstack([text_X[i] for i in train_idxs])
+    yt_train = np.tile(labels, len(train_idxs))
+    clf_t = LogisticRegression(max_iter=2000).fit(Xt_train, yt_train)
+    text_test_acc[layer_idx] = accuracy_score(labels, clf_t.predict(text_X[layer_idx]))
+
+layers = np.arange(TOTAL_LAYERS)
+
+plt.figure(figsize=(16,6))
+
+plt.subplot(1,2,1)
+plt.plot(layers, vision_test_acc, marker='o', linewidth=2)
+plt.axvspan(TRAINED_LAYER_START, TOTAL_LAYERS, alpha=0.15)
+plt.title("Vision Representation Test Accuracy")
+plt.xlabel("Layer")
+plt.ylabel("Top-1 Accuracy")
+plt.ylim(0,1)
+plt.xlim(0, TOTAL_LAYERS)
+plt.grid(True)
+
+plt.subplot(1,2,2)
+plt.plot(layers, text_test_acc, marker='o', linewidth=2)
+plt.axvspan(TRAINED_LAYER_START, TOTAL_LAYERS, alpha=0.15)
+plt.title("Text Representation Test Accuracy")
+plt.xlabel("Layer")
+plt.ylim(0,1)
+plt.xlim(0, TOTAL_LAYERS)
+plt.grid(True)
+
+plt.suptitle("Test Accuracy Across Layers — Vision vs Text", fontsize=16)
+plt.tight_layout()
+plt.show()
+
+print("\nLayer | Vision Test Acc | Text Test Acc")
+for i in range(TOTAL_LAYERS):
+    print(f"{i:02d}    {vision_test_acc[i]:.3f}           {text_test_acc[i]:.3f}")

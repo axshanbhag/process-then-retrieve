@@ -1,0 +1,439 @@
+# LOGIN (REPLACE WITH TOKEN)
+from huggingface_hub import login
+#login(token = "TOKEN")
+
+# libraries
+!pip install -q transformers datasets pillow torch matplotlib numpy requests accelerate huggingface_hub qwen-vl-utils
+
+import torch
+import torch.nn.functional as F
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
+from datasets import load_dataset
+from PIL import Image
+import numpy as np
+import matplotlib.pyplot as plt
+from io import BytesIO
+import requests
+import os
+import gc
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# Qwen
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+model_id = "Qwen/Qwen2-VL-2B-Instruct"
+
+processor = AutoProcessor.from_pretrained(model_id)
+model = Qwen2VLForConditionalGeneration.from_pretrained(
+    model_id,
+    output_attentions=True,
+    output_hidden_states=True,
+    torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+    device_map="auto",
+    attn_implementation="eager"
+)
+model.eval()
+
+# Clear any lingering memory
+if device == "cuda":
+    torch.cuda.empty_cache()
+gc.collect()
+
+# 10 Samples
+dataset = load_dataset("tomg-group-umd/pixelprose", split="train", streaming=True)
+dataset_iter = iter(dataset)
+
+def read_image_from_url(url):
+    try:
+        response = requests.get(url, timeout=10)
+        img = Image.open(BytesIO(response.content)).convert("RGB")
+        # Resize image to reduce memory footprint
+        img.thumbnail((448, 448), Image.Resampling.LANCZOS)
+        return img
+    except:
+        return None
+
+images = []
+captions = []
+attempt_count = 0
+
+while len(images) < 10 and attempt_count < 150: # Changed to 10 samples
+    try:
+        row = next(dataset_iter)
+        attempt_count += 1
+        img = read_image_from_url(row["url"])
+        if img is not None:
+            images.append(img)
+            captions.append(row["vlm_caption"])
+    except StopIteration:
+        break
+
+if len(images) < 10:
+    raise RuntimeError(f"Could only load {len(images)} valid images")
+
+# Setup Hooks
+attention_outputs = {}
+mlp_outputs = {}
+residual_before_attn = {}
+residual_after_attn = {}
+
+def create_attn_hook(layer_idx):
+    def hook(module, input, output):
+        # Store only what we need and immediately move to CPU
+        attention_outputs[layer_idx] = output[0].detach().cpu().to(torch.float32)
+        if len(input) > 0 and input[0] is not None:
+            residual_before_attn[layer_idx] = input[0].detach().cpu().to(torch.float32)
+        else:
+            residual_before_attn[layer_idx] = torch.zeros_like(output[0]).cpu().to(torch.float32)
+        # Clear GPU cache immediately
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return hook
+
+def create_mlp_hook(layer_idx):
+    def hook(module, input, output):
+        # Store only what we need and immediately move to CPU
+        mlp_outputs[layer_idx] = output.detach().cpu().to(torch.float32)
+        if len(input) > 0 and input[0] is not None:
+            residual_after_attn[layer_idx] = input[0].detach().cpu().to(torch.float32)
+        else:
+            residual_after_attn[layer_idx] = torch.zeros_like(output).cpu().to(torch.float32)
+        # Clear GPU cache immediately
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return hook
+
+handles = []
+num_layers = len(model.language_model.layers)
+
+for layer_idx, layer in enumerate(model.language_model.layers):
+    handles.append(layer.self_attn.register_forward_hook(create_attn_hook(layer_idx)))
+    handles.append(layer.mlp.register_forward_hook(create_mlp_hook(layer_idx)))
+
+all_attn_text_contrib = []
+all_mlp_text_contrib = []
+all_attn_vision_contrib = []
+all_mlp_vision_contrib = []
+
+for sample_idx, (image, caption) in enumerate(zip(images, captions)):
+    # Clear memory before processing each sample
+    attention_outputs.clear()
+    mlp_outputs.clear()
+    residual_before_attn.clear()
+    residual_after_attn.clear()
+
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    gc.collect()
+
+    try:
+        # Qwen2-VL uses a specific message format
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "image": image,
+                    },
+                    {"type": "text", "text": f"Describe this image: {caption[:50]}"},  # Shortened caption
+                ],
+            }
+        ]
+
+        # Apply chat template
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+        # Process inputs
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        ).to(device)
+
+        # Estimate vision tokens
+        if hasattr(inputs, 'pixel_values') and inputs.pixel_values is not None:
+            vision_tokens = 256
+        else:
+            vision_tokens = 0
+
+        # Run model inference
+        with torch.no_grad():
+            outputs = model(**inputs)
+
+        # Immediately extract what we need
+        hidden_states = outputs.hidden_states
+        seq_len = hidden_states[-1].shape[1]
+        input_ids = inputs.input_ids[0].cpu()
+
+        # Find text start position
+        text_start_idx = vision_tokens
+        for idx, token_id in enumerate(input_ids):
+            if idx > 10:
+                text_start_idx = idx
+                break
+
+        vision_tokens = min(text_start_idx, seq_len // 2)
+
+        # CRITICAL: Delete large objects immediately
+        del outputs
+        del hidden_states
+        del inputs
+        del image_inputs
+        del video_inputs
+
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
+
+        # Analyze Contributions for TEXT TOKENS
+        attn_text_contrib = []
+        mlp_text_contrib = []
+
+        for layer_idx in range(num_layers):
+            if (layer_idx not in attention_outputs or
+                layer_idx not in mlp_outputs or
+                layer_idx not in residual_before_attn or
+                layer_idx not in residual_after_attn):
+                continue
+
+            actual_seq_len = attention_outputs[layer_idx].shape[1]
+            if vision_tokens >= actual_seq_len:
+                continue
+
+            # Extract text tokens
+            attn_out = attention_outputs[layer_idx][0, vision_tokens:]
+            mlp_out = mlp_outputs[layer_idx][0, vision_tokens:]
+            res_before_attn = residual_before_attn[layer_idx][0, vision_tokens:]
+            res_after_attn = residual_after_attn[layer_idx][0, vision_tokens:]
+
+            if attn_out.shape[0] == 0:
+                continue
+
+            attn_delta = res_after_attn - res_before_attn
+            attn_norm = torch.norm(attn_delta, dim=-1).mean().item()
+
+            mlp_delta = mlp_out
+            mlp_norm = torch.norm(mlp_delta, dim=-1).mean().item()
+
+            total_norm = attn_norm + mlp_norm
+
+            if total_norm > 1e-8:
+                attn_rel = attn_norm / total_norm
+                mlp_rel = mlp_norm / total_norm
+            else:
+                attn_rel = 0.5
+                mlp_rel = 0.5
+
+            attn_text_contrib.append(attn_rel)
+            mlp_text_contrib.append(mlp_rel)
+
+        # vision tokens
+        attn_vision_contrib = []
+        mlp_vision_contrib = []
+
+        for layer_idx in range(num_layers):
+            if (layer_idx not in attention_outputs or
+                layer_idx not in mlp_outputs or
+                layer_idx not in residual_before_attn or
+                layer_idx not in residual_after_attn):
+                continue
+
+            actual_seq_len = attention_outputs[layer_idx].shape[1]
+            actual_vision_tokens = min(vision_tokens, actual_seq_len)
+
+            if actual_vision_tokens == 0:
+                continue
+
+            attn_out = attention_outputs[layer_idx][0, :actual_vision_tokens]
+            mlp_out = mlp_outputs[layer_idx][0, :actual_vision_tokens]
+            res_before_attn = residual_before_attn[layer_idx][0, :actual_vision_tokens]
+            res_after_attn = residual_after_attn[layer_idx][0, :actual_vision_tokens]
+
+            attn_delta = res_after_attn - res_before_attn
+            attn_norm = torch.norm(attn_delta, dim=-1).mean().item()
+
+            mlp_delta = mlp_out
+            mlp_norm = torch.norm(mlp_delta, dim=-1).mean().item()
+
+            total_norm = attn_norm + mlp_norm
+
+            if total_norm > 1e-8:
+                attn_rel = attn_norm / total_norm
+                mlp_rel = mlp_norm / total_norm
+            else:
+                attn_rel = 0.5
+                mlp_rel = 0.5
+
+            attn_vision_contrib.append(attn_rel)
+            mlp_vision_contrib.append(mlp_rel)
+
+        # Store results
+        all_attn_text_contrib.append(attn_text_contrib)
+        all_mlp_text_contrib.append(mlp_text_contrib)
+        all_attn_vision_contrib.append(attn_vision_contrib)
+        all_mlp_vision_contrib.append(mlp_vision_contrib)
+
+        # Clear hook dictionaries after processing
+        attention_outputs.clear()
+        mlp_outputs.clear()
+        residual_before_attn.clear()
+        residual_after_attn.clear()
+
+    except Exception as e:
+        print(f"Error processing sample {sample_idx + 1}: {str(e)}")
+        continue
+
+    finally:
+        # clean up after each sample
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
+
+# Remove hooks to free memory
+for handle in handles:
+    handle.remove()
+if device == "cuda":
+    torch.cuda.empty_cache()
+gc.collect()
+
+# average samples
+if len(all_attn_text_contrib) == 0 or len(all_attn_vision_contrib) == 0:
+    raise RuntimeError("No valid samples were processed!")
+
+max_len = max(len(x) for x in all_attn_text_contrib + all_attn_vision_contrib if len(x) > 0)
+
+def pad_to_length(arr_list, target_len):
+    padded = []
+    for arr in arr_list:
+        if len(arr) < target_len:
+            padded.append(arr + [arr[-1]] * (target_len - len(arr)) if len(arr) > 0 else [0.5] * target_len)
+        else:
+            padded.append(arr[:target_len])
+    return padded
+
+all_attn_text_contrib = pad_to_length(all_attn_text_contrib, max_len)
+all_mlp_text_contrib = pad_to_length(all_mlp_text_contrib, max_len)
+all_attn_vision_contrib = pad_to_length(all_attn_vision_contrib, max_len)
+all_mlp_vision_contrib = pad_to_length(all_mlp_vision_contrib, max_len)
+
+avg_attn_text = np.mean(all_attn_text_contrib, axis=0)
+avg_mlp_text = np.mean(all_mlp_text_contrib, axis=0)
+avg_attn_vision = np.mean(all_attn_vision_contrib, axis=0)
+avg_mlp_vision = np.mean(all_mlp_vision_contrib, axis=0)
+
+# graphs
+layers = np.arange(len(avg_attn_text))
+
+# Store absolute contribution values (before percentage conversion)
+abs_attn_text = avg_attn_text.copy()
+abs_mlp_text = avg_mlp_text.copy()
+abs_attn_vision = avg_attn_vision.copy()
+abs_mlp_vision = avg_mlp_vision.copy()
+
+# Convert to percentages for stacked bars
+attn_pct_text = avg_attn_text * 100
+mlp_pct_text = avg_mlp_text * 100
+attn_pct_vision = avg_attn_vision * 100
+mlp_pct_vision = avg_mlp_vision * 100
+
+# text tokens
+fig1, ax1 = plt.subplots(figsize=(10, 6))
+fig1.patch.set_facecolor('white')
+ax1.set_facecolor('white')
+
+ax1.bar(layers, attn_pct_text, color='#1976D2', alpha=0.7, label='Attention')
+ax1.bar(layers, mlp_pct_text, bottom=attn_pct_text, color='#D32F2F', alpha=0.7, label='MLP')
+
+ax1.set_xlabel('Layer', fontsize=12)
+ax1.set_ylabel('Contribution (%)', fontsize=12)
+ax1.set_title('Text Tokens: Attention vs MLP (Qwen2-VL)\n(Averaged over 10 samples)', fontsize=14, fontweight='bold')
+ax1.legend(loc='best', framealpha=0.9)
+ax1.grid(True, alpha=0.3, axis='y')
+ax1.spines['top'].set_visible(False)
+ax1.spines['right'].set_visible(False)
+
+plt.tight_layout()
+plt.show()
+
+fig2, ax2 = plt.subplots(figsize=(12, 7))
+fig2.patch.set_facecolor('white')
+ax2.set_facecolor('white')
+
+ax2.plot(layers, abs_attn_text, color='#1976D2', linewidth=2.5, marker='o', 
+         markersize=6, label='Attention', alpha=0.8)
+ax2.plot(layers, abs_mlp_text, color='#D32F2F', linewidth=2.5, marker='s', 
+         markersize=6, label='MLP', alpha=0.8)
+
+ax2.set_xlabel('Layer', fontsize=12)
+ax2.set_ylabel('Absolute Contribution (Normalized)', fontsize=12)
+ax2.set_title('Text Tokens: Absolute Contributions by Layer (Qwen2-VL)\n(Averaged over 10 samples)', 
+              fontsize=14, fontweight='bold')
+ax2.legend(loc='best', framealpha=0.9, fontsize=11)
+ax2.grid(True, alpha=0.3)
+ax2.spines['top'].set_visible(False)
+ax2.spines['right'].set_visible(False)
+
+plt.tight_layout()
+plt.show()
+
+# vision tokens
+fig3, ax3 = plt.subplots(figsize=(10, 6))
+fig3.patch.set_facecolor('white')
+ax3.set_facecolor('white')
+
+ax3.bar(layers, attn_pct_vision, color='#1976D2', alpha=0.7, label='Attention')
+ax3.bar(layers, mlp_pct_vision, bottom=attn_pct_vision, color='#D32F2F', alpha=0.7, label='MLP')
+
+ax3.set_xlabel('Layer', fontsize=12)
+ax3.set_ylabel('Contribution (%)', fontsize=12)
+ax3.set_title('Vision Tokens: Attention vs MLP (Qwen2-VL)\n(Averaged over 10 samples)', fontsize=14, fontweight='bold')
+ax3.legend(loc='best', framealpha=0.9)
+ax3.grid(True, alpha=0.3, axis='y')
+ax3.spines['top'].set_visible(False)
+ax3.spines['right'].set_visible(False)
+
+plt.tight_layout()
+plt.show()
+
+fig4, ax4 = plt.subplots(figsize=(12, 7))
+fig4.patch.set_facecolor('white')
+ax4.set_facecolor('white')
+
+ax4.plot(layers, abs_attn_vision, color='#1976D2', linewidth=2.5, marker='o', 
+         markersize=6, label='Attention', alpha=0.8)
+ax4.plot(layers, abs_mlp_vision, color='#D32F2F', linewidth=2.5, marker='s', 
+         markersize=6, label='MLP', alpha=0.8)
+
+ax4.set_xlabel('Layer', fontsize=12)
+ax4.set_ylabel('Absolute Contribution (Normalized)', fontsize=12)
+ax4.set_title('Vision Tokens: Absolute Contributions by Layer (Qwen2-VL)\n(Averaged over 10 samples)', 
+              fontsize=14, fontweight='bold')
+ax4.legend(loc='best', framealpha=0.9, fontsize=11)
+ax4.grid(True, alpha=0.3)
+ax4.spines['top'].set_visible(False)
+ax4.spines['right'].set_visible(False)
+plt.tight_layout()
+plt.show()
+
+
+
+# 9. Print Summary Statistics
+print("\nTEXT TOKENS:")
+print(f"  Average Attention Contribution: {np.mean(avg_attn_text)*100:.2f}%")
+print(f"  Average MLP Contribution: {np.mean(avg_mlp_text)*100:.2f}%")
+print(f"  Attention Range: [{np.min(abs_attn_text):.4f}, {np.max(abs_attn_text):.4f}]")
+print(f"  MLP Range: [{np.min(abs_mlp_text):.4f}, {np.max(abs_mlp_text):.4f}]")
+
+print("\nVISION TOKENS:")
+print(f"  Average Attention Contribution: {np.mean(avg_attn_vision)*100:.2f}%")
+print(f"  Average MLP Contribution: {np.mean(avg_mlp_vision)*100:.2f}%")
+print(f"  Attention Range: [{np.min(abs_attn_vision):.4f}, {np.max(abs_attn_vision):.4f}]")
+print(f"  MLP Range: [{np.min(abs_mlp_vision):.4f}, {np.max(abs_mlp_vision):.4f}]")

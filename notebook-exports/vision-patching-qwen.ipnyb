@@ -1,0 +1,165 @@
+!pip install qwen-vl-utils
+
+import torch
+import numpy as np
+import requests
+from PIL import Image, UnidentifiedImageError
+from io import BytesIO
+from datasets import load_dataset
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
+
+# setup and load device
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model_id = "Qwen/Qwen2-VL-2B-Instruct"
+
+# load model and processor
+processor = AutoProcessor.from_pretrained(model_id)
+model = Qwen2VLForConditionalGeneration.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
+    device_map="auto",
+)
+model.eval()
+
+# load dataset
+dataset = load_dataset("tomg-group-umd/pixelprose", split="train[:100]")
+
+# vision tower
+vision_layers = model.visual.blocks
+# sample source layer configuration, can change to be any three layers
+SOURCE_LAYERS = [8, 9, 10]
+# patching into the last three layers
+TARGET_LAYERS = [-4, -3, -2]
+answer = "2"  # target answer
+prompt_text = "How many objects are in the image?"
+
+def load_image(url, timeout=10):
+    try:
+        r = requests.get(url, timeout=timeout)
+        if r.status_code != 200 or "image" not in r.headers.get("Content-Type", ""):
+            return None
+        img = Image.open(BytesIO(r.content))
+        img.verify() # verify it's a valid image
+        img = Image.open(BytesIO(r.content)).convert("RGB")
+        return img
+    except (UnidentifiedImageError, OSError, requests.RequestException):
+        return None
+
+# hook
+clean_activations = {}
+
+def save_activation_hook(layer_id):
+    def hook(module, inp, out):
+        clean_activations[layer_id] = out.detach()
+    return hook
+
+def patch_activation_hook(src_layer):
+    def hook(module, inp, out):
+        patched = clean_activations[src_layer]
+        # Qwen2-VL uses dynamic resolutions, so shapes must match exactly
+        if out.shape != patched.shape:
+             return out 
+        return patched
+    return hook
+
+# execution
+results = []
+MAX_IMAGES = 100
+processed = 0
+
+for url in dataset["url"]:
+    if processed >= MAX_IMAGES:
+        break
+
+    img = load_image(url)
+    if img is None:
+        continue
+
+    processed += 1
+
+    # QWEN2-VL format
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": url},
+                {"type": "text", "text": prompt_text},
+            ],
+        }
+    ]
+    
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    ).to(device)
+
+    # prepare labels (except for the very last token)
+    answer_token_ids = processor.tokenizer(answer, add_special_tokens=False).input_ids
+    answer_token_id = answer_token_ids[0]
+    
+    labels = inputs["input_ids"].clone()
+    labels[:, :] = -100
+    labels[:, -1] = answer_token_id
+
+    # clean run
+    clean_activations.clear()
+    save_handles = [
+        vision_layers[src].register_forward_hook(save_activation_hook(src))
+        for src in SOURCE_LAYERS
+    ]
+
+    with torch.no_grad():
+        clean_outputs = model(**inputs, labels=labels)
+
+    for h in save_handles: h.remove()
+
+    clean_logits = clean_outputs.logits[:, -1, :]
+    clean_score = clean_logits[0, answer_token_id].item()
+    clean_loss = clean_outputs.loss.item()
+
+    # patched run
+    patch_handles = [
+        vision_layers[tgt].register_forward_hook(patch_activation_hook(src))
+        for src, tgt in zip(SOURCE_LAYERS, TARGET_LAYERS)
+    ]
+
+    with torch.no_grad():
+        patched_outputs = model(**inputs, labels=labels)
+
+    for h in patch_handles: h.remove()
+
+    patched_logits = patched_outputs.logits[:, -1, :]
+    patched_score = patched_logits[0, answer_token_id].item()
+    patched_loss = patched_outputs.loss.item()
+
+    results.append({
+        "clean_score": clean_score,
+        "patched_score": patched_score,
+        "delta": patched_score - clean_score,
+        "clean_loss": clean_loss,
+        "patched_loss": patched_loss
+    })
+
+# results
+if len(results) > 0:
+    avg_clean_score = np.mean([r["clean_score"] for r in results])
+    avg_patched_score = np.mean([r["patched_score"] for r in results])
+    avg_delta = np.mean([r["delta"] for r in results])
+    avg_clean_loss = np.mean([r["clean_loss"] for r in results])
+    avg_patched_loss = np.mean([r["patched_loss"] for r in results])
+
+    print("\n--- Averaged Patching Results (Qwen2-VL) ---")
+    print(f"Images processed:     {len(results)}")
+    print(f"Avg Clean score:      {avg_clean_score:.4f}")
+    print(f"Avg Patched score:    {avg_patched_score:.4f}")
+    print(f"Avg Δ logit:          {avg_delta:.4f}")
+    print(f"Avg Clean loss:       {avg_clean_loss:.4f}")
+    print(f"Avg Patched loss:     {avg_patched_loss:.4f}")
+else:
+    print("No images were successfully processed.")

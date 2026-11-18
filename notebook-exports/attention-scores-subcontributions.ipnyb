@@ -1,0 +1,221 @@
+import torch
+from transformers import AutoProcessor
+from datasets import load_dataset
+from PIL import Image
+import numpy as np
+import matplotlib.pyplot as plt
+from io import BytesIO
+import requests
+from IPython.display import display, HTML
+from transformers import PaliGemmaForConditionalGeneration, AutoProcessor
+from PIL import Image
+import requests
+from typing import Dict, List, Tuple
+
+!pip install -q transformers datasets pillow torch matplotlib numpy tqdm requests circuitsvis accelerate huggingface_hub
+
+# LOGIN (REPLACE WITH TOKEN)
+from huggingface_hub import login
+#login(token = "TOKEN")
+
+# Helpers
+class AttentionSubContributionAnalyzer:
+
+    def __init__(self, image_tokens: int):
+        self.image_tokens = image_tokens
+
+    def extract_regions(self, attention_matrix: np.ndarray, num_text_tokens: int) -> Dict[str, np.ndarray]:
+        img = self.image_tokens
+
+        regions = {
+            'image_image': attention_matrix[:img, :img],
+            'image_text': attention_matrix[:img, img:img+num_text_tokens],
+            'text_image': attention_matrix[img:img+num_text_tokens, :img],
+            'text_text': attention_matrix[img:img+num_text_tokens, img:img+num_text_tokens]
+        }
+
+        return regions
+
+    def compute_region_stats(self, regions: Dict[str, np.ndarray]) -> Dict[str, Dict[str, float]]:
+        stats = {}
+
+        for name, matrix in regions.items():
+            stats[name] = {
+                'mean': float(np.mean(matrix)),
+                'std': float(np.std(matrix)),
+                'min': float(np.min(matrix)),
+                'max': float(np.max(matrix)),
+                'median': float(np.median(matrix))
+            }
+
+        return stats
+
+    def visualize_individual_regions(self, attention_matrix: np.ndarray,
+                                    num_text_tokens: int,
+                                    layer_idx: int = 0,
+                                    downsample_img: int = 8,
+                                    figsize: Tuple[int, int] = (16, 12)):
+
+        regions = self.extract_regions(attention_matrix, num_text_tokens)
+        stats = self.compute_region_stats(regions)
+
+        fig, axes = plt.subplots(2, 2, figsize=figsize)
+        fig.suptitle(f'Layer {layer_idx} - Individual Region Heatmaps', fontsize=16, fontweight='bold')
+
+        region_list = [
+            ('image_image', 'Image to Image', 'Blues', (0, 0)),
+            ('text_image', 'Text to Image', 'Greens', (1, 0)),
+            ('image_text', 'Image to Text', 'Oranges', (0, 1)),
+            ('text_text', 'Text to Text', 'Reds', (1, 1))
+        ]
+
+        for region_name, title, cmap, (row, col) in region_list:
+            region_data = regions[region_name]
+            region_stat = stats[region_name]
+
+            # Downsample image regions for visualization
+            if 'image' in region_name.split('_')[0]:  # If query is image
+                display_data = region_data[::downsample_img, :]
+            else:
+                display_data = region_data
+
+            if 'image' in region_name.split('_')[1]:  # If key is image
+                display_data = display_data[:, ::downsample_img]
+
+            ax = axes[row, col]
+            im = ax.imshow(display_data, cmap=cmap, aspect='auto', interpolation='nearest')
+            ax.set_title(f'{title}\nMean: {region_stat["mean"]:.6f}', fontweight='bold', fontsize=12)
+
+            # Set axis labels based on region
+            query_type = region_name.split('_')[0]
+            key_type = region_name.split('_')[1]
+            ax.set_ylabel(f'{query_type.capitalize()} Tokens (Query)', fontsize=10)
+            ax.set_xlabel(f'{key_type.capitalize()} Tokens (Key)', fontsize=10)
+
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+            # Add grid for better readability
+            ax.grid(False)
+
+        plt.tight_layout()
+        plt.show()
+
+
+def extract_paligemma_attention(model, processor, image, text_prompt):
+
+    inputs = processor(images=image, text=text_prompt, return_tensors="pt")
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = model(**inputs, output_attentions=True, output_hidden_states=True)
+
+    attention_matrices = []
+    if hasattr(outputs, 'attentions') and outputs.attentions is not None:
+        for layer_attn in outputs.attentions:
+            # The attentions are usually a tuple of (batch_size, num_heads, sequence_length, sequence_length)
+            # average over heads and batch if batch_size is 1
+            avg_attn = layer_attn[0].mean(dim=0).cpu().numpy()
+            attention_matrices.append(avg_attn)
+    else:
+        raise ValueError("Model did not output attentions")
+
+    return attention_matrices
+
+# Load PaliGemma model
+model_id = "google/paligemma-3b-pt-448"
+model = PaliGemmaForConditionalGeneration.from_pretrained( # Changed from AutoModelForVision2Seq
+    model_id,
+    torch_dtype=torch.float16,
+    device_map="auto",
+    attn_implementation="eager",
+    output_attentions=True
+).eval()
+
+processor = AutoProcessor.from_pretrained(model_id)
+
+# Load image
+url = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/car.jpg"
+image = Image.open(requests.get(url, stream=True).raw)
+
+# Extract attention matrices
+text_prompt = "What is in this image?"
+attention_matrices = extract_paligemma_attention(model, processor, image, text_prompt)
+
+print(f"Extracted {len(attention_matrices)} layers of attention")
+print(f"Each attention matrix shape: {attention_matrices[0].shape}")
+
+# Get text token count
+analyzer = AttentionSubContributionAnalyzer(image_tokens=1024)
+
+# Calculate number of text tokens
+inputs = processor(images=image, text=text_prompt, return_tensors="pt")
+num_text_tokens = inputs['input_ids'].shape[1] - 1024
+print(f"Number of text tokens: {num_text_tokens}")
+
+# Visualize a specific layer as a heatmap (like adjacency matrix)
+layer_to_visualize = 10
+
+analyzer.visualize_individual_regions(
+    attention_matrices[layer_to_visualize],
+    num_text_tokens,
+    layer_idx=layer_to_visualize,
+    downsample_img=8
+)
+
+from matplotlib import pyplot as plt
+
+# Line/bar charts showing how regions change across layers
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 8))
+
+layers = list(range(len(attention_matrices)))
+img_img_means = []
+txt_img_means = []
+img_txt_means = []
+txt_txt_means = []
+
+for layer_idx in layers:
+    regions = analyzer.extract_regions(attention_matrices[layer_idx], num_text_tokens)
+    stats = analyzer.compute_region_stats(regions)
+
+    img_img_means.append(stats['image_image']['mean'])
+    txt_img_means.append(stats['text_image']['mean'])
+    img_txt_means.append(stats['image_text']['mean'])
+    txt_txt_means.append(stats['text_text']['mean'])
+
+# Line plot
+ax1.plot(layers, img_img_means, 'o-', label='Image to Image', color='blue', linewidth=2)
+ax1.plot(layers, txt_img_means, 's-', label='Text to Image', color='green', linewidth=2)
+ax1.plot(layers, img_txt_means, '^-', label='Image to Text', color='orange', linewidth=2)
+ax1.plot(layers, txt_txt_means, 'd-', label='Text to Text', color='red', linewidth=2)
+ax1.set_xlabel('Layer')
+ax1.set_ylabel('Mean Attention Score')
+ax1.set_title('Attention Sub-contributions Across Layers')
+ax1.legend()
+ax1.grid(alpha=0.3)
+
+# Bar plot
+x = np.arange(len(layers))
+width = 0.2
+ax2.bar(x - 1.5*width, img_img_means, width, label='Image to Image', color='blue', alpha=0.8)
+ax2.bar(x - 0.5*width, txt_img_means, width, label='Text to Image', color='green', alpha=0.8)
+ax2.bar(x + 0.5*width, img_txt_means, width, label='Image to Text', color='orange', alpha=0.8)
+ax2.bar(x + 1.5*width, txt_txt_means, width, label='Text to Text', color='red', alpha=0.8)
+ax2.set_xlabel('Layer')
+ax2.set_ylabel('Mean Attention Score')
+ax2.set_title('Attention Sub-contributions (Bar View)')
+ax2.set_xticks(x[::2])
+ax2.set_xticklabels(layers[::2])
+ax2.legend()
+ax2.grid(alpha=0.3, axis='y')
+
+plt.tight_layout()
+plt.show()
+
+# Analysis
+regions = analyzer.extract_regions(attention_matrices[layer_to_visualize], num_text_tokens)
+stats = analyzer.compute_region_stats(regions)
+
+for region_name, region_stats in stats.items():
+    print(f"\n{region_name.replace('_', ' ').title()}:")
+    for stat_name, stat_value in region_stats.items():
+        print(f"  {stat_name}: {stat_value:.8f}")

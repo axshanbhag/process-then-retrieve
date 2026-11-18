@@ -1,0 +1,241 @@
+# login (REPLACE WITH TOKEN)
+from huggingface_hub import login
+#login(token = "TOKEN")
+
+# libraries
+!pip install -q transformers datasets pillow torch matplotlib numpy requests accelerate huggingface_hub qwen-vl-utils
+
+import torch
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
+from datasets import load_dataset
+from PIL import Image
+import numpy as np
+import matplotlib.pyplot as plt
+from io import BytesIO
+import requests
+import os
+import gc
+from typing import Dict, List, Tuple
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# helpers
+class AttentionSubContributionAnalyzer:
+    def __init__(self, image_tokens: int = 256):
+        self.image_tokens = image_tokens
+
+    def extract_regions(self, attention_matrix: np.ndarray, num_text_tokens: int) -> Dict[str, np.ndarray]:
+        img = self.image_tokens
+
+        regions = {
+            'image_image': attention_matrix[:img, :img],
+            'image_text': attention_matrix[:img, img:img+num_text_tokens],
+            'text_image': attention_matrix[img:img+num_text_tokens, :img],
+            'text_text': attention_matrix[img:img+num_text_tokens, img:img+num_text_tokens]
+        }
+
+        return regions
+
+    def compute_region_stats(self, regions: Dict[str, np.ndarray]) -> Dict[str, Dict[str, float]]:
+        stats = {}
+
+        for name, matrix in regions.items():
+            stats[name] = {
+                'mean': float(np.mean(matrix)),
+                'std': float(np.std(matrix)),
+                'min': float(np.min(matrix)),
+                'max': float(np.max(matrix)),
+                'median': float(np.median(matrix))
+            }
+
+        return stats
+
+    def visualize_individual_regions(self, attention_matrix: np.ndarray,
+                                    num_text_tokens: int,
+                                    layer_idx: int = 0,
+                                    downsample_img: int = 8,
+                                    figsize: Tuple[int, int] = (16, 12)): 
+        regions = self.extract_regions(attention_matrix, num_text_tokens)
+        stats = self.compute_region_stats(regions)
+
+        fig, axes = plt.subplots(2, 2, figsize=figsize)
+        fig.suptitle(f'Layer {layer_idx} - Individual Region Heatmaps (Qwen2-VL)', fontsize=16, fontweight='bold')
+
+        region_list = [
+            ('image_image', 'Image to Image', 'Blues', (0, 0)),
+            ('text_image', 'Text to Image', 'Greens', (1, 0)),
+            ('image_text', 'Image to Text', 'Oranges', (0, 1)),
+            ('text_text', 'Text to Text', 'Reds', (1, 1))
+        ]
+
+        for region_name, title, cmap, (row, col) in region_list:
+            region_data = regions[region_name]
+            region_stat = stats[region_name]
+
+            # Downsample image regions for visualization
+            if 'image' in region_name.split('_')[0]:  # If query is image
+                display_data = region_data[::downsample_img, :]
+            else:
+                display_data = region_data
+
+            if 'image' in region_name.split('_')[1]:  # If key is image
+                display_data = display_data[:, ::downsample_img]
+
+            ax = axes[row, col]
+            im = ax.imshow(display_data, cmap=cmap, aspect='auto', interpolation='nearest')
+            ax.set_title(f'{title}\nMean: {region_stat["mean"]:.6f}', fontweight='bold', fontsize=12)
+
+            # Set axis labels based on region
+            query_type = region_name.split('_')[0]
+            key_type = region_name.split('_')[1]
+            ax.set_ylabel(f'{query_type.capitalize()} Tokens (Query)', fontsize=10)
+            ax.set_xlabel(f'{key_type.capitalize()} Tokens (Key)', fontsize=10)
+
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+            # Add grid for better readability
+            ax.grid(False)
+
+        plt.tight_layout()
+        plt.show()
+
+
+def extract_qwen_attention(model, processor, image, text_prompt):
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "image": image,
+                },
+                {"type": "text", "text": text_prompt},
+            ],
+        }
+    ]
+    text = processor.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    ).to(model.device)
+
+    with torch.no_grad():
+        outputs = model(**inputs, output_attentions=True, output_hidden_states=True)
+
+    attention_matrices = []
+    for layer_attn in outputs.attentions:
+        avg_attn = layer_attn[0].mean(dim=0).cpu().numpy()
+        attention_matrices.append(avg_attn)
+
+    return attention_matrices, inputs
+
+# Processing
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model_id = "Qwen/Qwen2-VL-2B-Instruct"
+
+processor = AutoProcessor.from_pretrained(model_id)
+model = Qwen2VLForConditionalGeneration.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+    device_map="auto",
+    attn_implementation="eager"  
+).eval()
+
+# Clear memory
+if device == "cuda":
+    torch.cuda.empty_cache()
+gc.collect()
+
+# load img
+url = "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/transformers/tasks/car.jpg"
+image = Image.open(requests.get(url, stream=True).raw)
+text_prompt = "What is in this image?"
+attention_matrices, inputs = extract_qwen_attention(model, processor, image, text_prompt)
+
+# text token count
+# Qwen2-VL uses 256 vision tokens
+if hasattr(inputs, 'pixel_values') and inputs.pixel_values is not None:
+    vision_tokens = 256 
+else:
+    vision_tokens = 0
+
+# Calculate text tokens
+total_tokens = attention_matrices[0].shape[0]
+num_text_tokens = total_tokens - vision_tokens
+
+print(f"Total tokens: {total_tokens}")
+print(f"Vision tokens: {vision_tokens}")
+print(f"Text tokens: {num_text_tokens}")
+
+analyzer = AttentionSubContributionAnalyzer(image_tokens=vision_tokens)
+layer_to_visualize = 10
+
+analyzer.visualize_individual_regions(
+    attention_matrices[layer_to_visualize],
+    num_text_tokens,
+    layer_idx=layer_to_visualize,
+    downsample_img=8
+)
+
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 8))
+
+layers = list(range(len(attention_matrices)))
+img_img_means = []
+txt_img_means = []
+img_txt_means = []
+txt_txt_means = []
+
+for layer_idx in layers:
+    regions = analyzer.extract_regions(attention_matrices[layer_idx], num_text_tokens)
+    stats = analyzer.compute_region_stats(regions)
+
+    img_img_means.append(stats['image_image']['mean'])
+    txt_img_means.append(stats['text_image']['mean'])
+    img_txt_means.append(stats['image_text']['mean'])
+    txt_txt_means.append(stats['text_text']['mean'])
+
+# Line plot
+ax1.plot(layers, img_img_means, 'o-', label='Image→Image', color='blue', linewidth=2)
+ax1.plot(layers, txt_img_means, 's-', label='Text→Image', color='green', linewidth=2)
+ax1.plot(layers, img_txt_means, '^-', label='Image→Text', color='orange', linewidth=2)
+ax1.plot(layers, txt_txt_means, 'd-', label='Text→Text', color='red', linewidth=2)
+ax1.set_xlabel('Layer')
+ax1.set_ylabel('Mean Attention Score')
+ax1.set_title('Attention Sub-contributions Across Layers (Qwen2-VL)')
+ax1.legend()
+ax1.grid(alpha=0.3)
+
+# Bar plot
+x = np.arange(len(layers))
+width = 0.2
+ax2.bar(x - 1.5*width, img_img_means, width, label='Image→Image', color='blue', alpha=0.8)
+ax2.bar(x - 0.5*width, txt_img_means, width, label='Text→Image', color='green', alpha=0.8)
+ax2.bar(x + 0.5*width, img_txt_means, width, label='Image→Text', color='orange', alpha=0.8)
+ax2.bar(x + 1.5*width, txt_txt_means, width, label='Text→Text', color='red', alpha=0.8)
+ax2.set_xlabel('Layer')
+ax2.set_ylabel('Mean Attention Score')
+ax2.set_title('Attention Sub-contributions (Bar View)')
+ax2.set_xticks(x[::2])
+ax2.set_xticklabels(layers[::2])
+ax2.legend()
+ax2.grid(alpha=0.3, axis='y')
+
+plt.tight_layout()
+plt.show()
+
+# Print
+regions = analyzer.extract_regions(attention_matrices[layer_to_visualize], num_text_tokens)
+stats = analyzer.compute_region_stats(regions)
+
+for region_name, region_stats in stats.items():
+    print(f"\n{region_name.replace('_', ' ').title()}:")
+    for stat_name, stat_value in region_stats.items():
+        print(f"  {stat_name}: {stat_value:.8f}")

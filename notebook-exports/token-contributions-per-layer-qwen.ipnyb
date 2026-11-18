@@ -1,0 +1,282 @@
+# LOGIN (REPLACE WITH TOKEN)
+from huggingface_hub import login
+#login(token = "TOKEN")
+
+# LIBRARIES
+!pip install -q transformers datasets pillow torch matplotlib numpy requests accelerate huggingface_hub qwen-vl-utils
+
+import torch
+from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+from qwen_vl_utils import process_vision_info
+from datasets import load_dataset
+from PIL import Image
+import numpy as np
+import matplotlib.pyplot as plt
+from io import BytesIO
+import requests
+import torch.nn.functional as F
+import os
+import gc
+
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+#processing
+device = "cuda" if torch.cuda.is_available() else "cpu"
+model_id = "Qwen/Qwen2-VL-2B-Instruct"
+
+processor = AutoProcessor.from_pretrained(model_id)
+model = Qwen2VLForConditionalGeneration.from_pretrained(
+    model_id,
+    output_attentions=True,
+    output_hidden_states=True,
+    torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+    device_map="auto"
+)
+model.eval()
+
+# Load Sample Image
+dataset = load_dataset("tomg-group-umd/pixelprose", split="train", streaming=True)
+dataset_iter = iter(dataset)
+
+def read_image_from_url(url):
+    try:
+        response = requests.get(url, timeout=10)
+        img = Image.open(BytesIO(response.content)).convert("RGB")
+        # Resize image to reduce memory footprint
+        img.thumbnail((448, 448), Image.Resampling.LANCZOS)
+        return img
+    except:
+        return None
+
+image = None
+caption = None
+attempt_count = 0
+
+while image is None and attempt_count < 50:
+    try:
+        row = next(dataset_iter)
+        attempt_count += 1
+        img = read_image_from_url(row["url"])
+        if img is not None:
+            image = img
+            caption = row["vlm_caption"]
+            break
+    except StopIteration:
+        break
+
+if image is None:
+    raise RuntimeError("Could not load any valid images")
+
+print(f"Caption: {caption}")
+
+# Qwen2-VL uses a specific message format
+messages = [
+    {
+        "role": "user",
+        "content": [
+            {
+                "type": "image",
+                "image": image,
+            },
+            {"type": "text", "text": caption},
+        ],
+    }
+]
+
+text = processor.apply_chat_template(
+    messages, tokenize=False, add_generation_prompt=True
+)
+
+image_inputs, video_inputs = process_vision_info(messages)
+inputs = processor(
+    text=[text],
+    images=image_inputs,
+    videos=video_inputs,
+    padding=True,
+    return_tensors="pt",
+).to(device)
+
+input_ids = inputs['input_ids'][0].cpu().tolist()
+tokens = processor.tokenizer.convert_ids_to_tokens(input_ids)
+
+# Extract Hidden States
+with torch.no_grad():
+    outputs = model(**inputs)
+
+hidden_states = outputs.hidden_states
+num_layers = len(hidden_states) - 1
+seq_len = hidden_states[0].shape[1]
+
+# count tokens (qwen uses 256 img)
+if hasattr(inputs, 'pixel_values') and inputs.pixel_values is not None:
+    vision_tokens = 256 
+else:
+    vision_tokens = 0
+
+# Find text start position by looking at tokens
+text_start_idx = vision_tokens
+for idx, token_id in enumerate(input_ids):
+    if idx > 10: 
+        text_start_idx = idx
+        break
+
+# Adjust vision tokens based on actual sequence
+vision_tokens = min(text_start_idx, seq_len // 2)
+text_tokens_count = seq_len - vision_tokens
+
+print(f"\nToken Distribution:")
+print(f"  Total sequence length: {seq_len}")
+print(f"  Estimated vision tokens: {vision_tokens}")
+print(f"  Estimated text tokens: {text_tokens_count}")
+
+if vision_tokens > seq_len:
+    raise ValueError(f"Vision tokens ({vision_tokens}) exceeds sequence length ({seq_len}), please fix any errors.")
+
+# Residual Changes for Vision Tokens
+print("Residual Stream Changes in Vision Tokens")
+
+vision_contributions = []
+vision_norms = []
+vision_changes_norm = []
+
+for layer_idx in range(num_layers):
+    h_before = hidden_states[layer_idx][0].cpu()
+    h_after = hidden_states[layer_idx + 1][0].cpu()
+
+    vision_before = h_before[:vision_tokens]
+    vision_after = h_after[:vision_tokens]
+
+    delta = vision_after - vision_before
+    delta_norm = torch.norm(delta, dim=-1).mean().item()
+    after_norm = torch.norm(vision_after, dim=-1).mean().item()
+    relative_contribution = delta_norm / (after_norm + 1e-8)
+
+    vision_contributions.append(relative_contribution)
+    vision_norms.append(after_norm)
+    vision_changes_norm.append(delta_norm)
+
+    print(f"Layer {layer_idx:2d}: Δ_norm={delta_norm:8.4f}, "
+          f"Total_norm={after_norm:8.4f}, "
+          f"Relative={relative_contribution:6.2%}")
+
+# Residual Changes for Text Tokens
+print("Residual Stream Changes in Text Tokens")
+
+text_contributions = []
+text_norms = []
+text_changes_norm = []
+
+for layer_idx in range(num_layers):
+    h_before = hidden_states[layer_idx][0].cpu()
+    h_after = hidden_states[layer_idx + 1][0].cpu()
+
+    # Extract text tokens (after vision tokens)
+    text_before = h_before[vision_tokens:]
+    text_after = h_after[vision_tokens:]
+
+    delta = text_after - text_before
+    delta_norm = torch.norm(delta, dim=-1).mean().item()
+    after_norm = torch.norm(text_after, dim=-1).mean().item()
+    relative_contribution = delta_norm / (after_norm + 1e-8)
+
+    text_contributions.append(relative_contribution)
+    text_norms.append(after_norm)
+    text_changes_norm.append(delta_norm)
+
+    print(f"Layer {layer_idx:2d}: Δ_norm={delta_norm:8.4f}, "
+          f"Total_norm={after_norm:8.4f}, "
+          f"Relative={relative_contribution:6.2%}")
+
+# Cosine Similarity Analysis
+early_cutoff = num_layers // 3
+mid_cutoff = 2 * num_layers // 3
+
+def cosine_similarity_mean(x, y):
+    cos_sim = F.cosine_similarity(x, y, dim=-1)
+    return cos_sim.mean().item()
+
+def l2_distance_mean(x, y):
+    return torch.norm(x - y, dim=-1).mean().item()
+
+# Vision tokens
+vision_embedding_repr = hidden_states[0][0, :vision_tokens].cpu()
+vision_final_repr = hidden_states[-1][0, :vision_tokens].cpu()
+vision_early_repr = hidden_states[early_cutoff][0, :vision_tokens].cpu()
+vision_mid_repr = hidden_states[mid_cutoff][0, :vision_tokens].cpu()
+
+vision_early_to_final_cos = cosine_similarity_mean(vision_early_repr, vision_final_repr)
+vision_mid_to_final_cos = cosine_similarity_mean(vision_mid_repr, vision_final_repr)
+vision_embed_to_final_cos = cosine_similarity_mean(vision_embedding_repr, vision_final_repr)
+
+# Text tokens
+text_embedding_repr = hidden_states[0][0, vision_tokens:].cpu()
+text_final_repr = hidden_states[-1][0, vision_tokens:].cpu()
+text_early_repr = hidden_states[early_cutoff][0, vision_tokens:].cpu()
+text_mid_repr = hidden_states[mid_cutoff][0, vision_tokens:].cpu()
+
+text_early_to_final_cos = cosine_similarity_mean(text_early_repr, text_final_repr)
+text_mid_to_final_cos = cosine_similarity_mean(text_mid_repr, text_final_repr)
+text_embed_to_final_cos = cosine_similarity_mean(text_embedding_repr, text_final_repr)
+
+print(f"\n Vision Tokens")
+print(f"  Initial embeddings to Final: {vision_embed_to_final_cos:.4f}")
+print(f"  After early layers (L{early_cutoff}) to Final: {vision_early_to_final_cos:.4f}")
+print(f"  After mid layers (L{mid_cutoff}) to Final: {vision_mid_to_final_cos:.4f}")
+
+print(f"\n Text Tokens")
+print(f"  Initial embeddings to Final: {text_embed_to_final_cos:.4f}")
+print(f"  After early layers (L{early_cutoff}) to Final: {text_early_to_final_cos:.4f}")
+print(f"  After mid layers (L{mid_cutoff}) to Final: {text_mid_to_final_cos:.4f}")
+
+# Plots
+layers = np.arange(num_layers)
+
+# Vision Token Changes Graph
+fig1, ax1 = plt.subplots(figsize=(10, 6))
+fig1.patch.set_facecolor('white')
+ax1.set_facecolor('white')
+ax1.plot(layers, vision_changes_norm, 'o-', color='#2E7D32', linewidth=2, markersize=8)
+ax1.set_xlabel('Layer', fontsize=12, fontweight='bold')
+ax1.set_ylabel('Avg Norm of Change (Δ)', fontsize=12, fontweight='bold')
+ax1.set_title(f'Vision Token Changes per Layer (Qwen2-VL)\n({vision_tokens} vision tokens)',
+              fontsize=13, fontweight='bold')
+ax1.grid(True, alpha=0.3)
+ax1.spines['top'].set_visible(False)
+ax1.spines['right'].set_visible(False)
+plt.tight_layout()
+plt.show()
+
+# Text Token Changes Graph
+fig2, ax2 = plt.subplots(figsize=(10, 6))
+fig2.patch.set_facecolor('white')
+ax2.set_facecolor('white')
+ax2.plot(layers, text_changes_norm, 'o-', color='#C62828', linewidth=2, markersize=8)
+ax2.set_xlabel('Layer', fontsize=12, fontweight='bold')
+ax2.set_ylabel('Avg Norm of Change (Δ)', fontsize=12, fontweight='bold')
+ax2.set_title(f'Text Token Changes per Layer (Qwen2-VL)\n({text_tokens_count} text tokens)',
+              fontsize=13, fontweight='bold')
+ax2.grid(True, alpha=0.3)
+ax2.spines['top'].set_visible(False)
+ax2.spines['right'].set_visible(False)
+plt.tight_layout()
+plt.show()
+
+# Print
+vision_total_change = sum(vision_changes_norm)
+vision_early_change = sum(vision_changes_norm[:early_cutoff])
+vision_mid_change = sum(vision_changes_norm[early_cutoff:mid_cutoff])
+vision_late_change = sum(vision_changes_norm[mid_cutoff:])
+
+text_total_change = sum(text_changes_norm)
+text_early_change = sum(text_changes_norm[:early_cutoff])
+text_mid_change = sum(text_changes_norm[early_cutoff:mid_cutoff])
+text_late_change = sum(text_changes_norm[mid_cutoff:])
+
+print(f"\nVision Token Processing:")
+print(f"  Early layers (0-{early_cutoff-1}): {vision_early_change:.4f} ({vision_early_change/vision_total_change*100:.1f}%)")
+print(f"  Middle layers ({early_cutoff}-{mid_cutoff-1}): {vision_mid_change:.4f} ({vision_mid_change/vision_total_change*100:.1f}%)")
+print(f"  Late layers ({mid_cutoff}-{num_layers-1}): {vision_late_change:.4f} ({vision_late_change/vision_total_change*100:.1f}%)")
+
+print(f"\nText Token Processing:")
+print(f"  Early layers (0-{early_cutoff-1}): {text_early_change:.4f} ({text_early_change/text_total_change*100:.1f}%)")
+print(f"  Middle layers ({early_cutoff}-{mid_cutoff-1}): {text_mid_change:.4f} ({text_mid_change/text_total_change*100:.1f}%)")
+print(f"  Late layers ({mid_cutoff}-{num_layers-1}): {text_late_change:.4f} ({text_late_change/text_total_change*100:.1f}%)")
