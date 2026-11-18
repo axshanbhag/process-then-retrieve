@@ -1,4 +1,4 @@
-# Process-then-Retrieve
+# process-then-retrieve
 
 This repository is an organized copy of the collaborative [Process-then-Retrieve repository](https://github.com/jtranx10/Process-then-Retrieve). See the papers below for the author lists.
 
